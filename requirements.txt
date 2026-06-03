@@ -1,4 +1,6 @@
 pyTelegramBotAPI
-requests
 yt-dlp
-ffmpeg
+ffmpeg-python
+requests
+aiohttp
+urllib3
