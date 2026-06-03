@@ -1,0 +1,887 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Universal Media Downloader & Shazam Bot
+Author:Professional Python Developer
+Platform: Telegram
+
+Libraries: pyTelegramBotAPI, yt-dlp, sqlite3, shazamio, asyncio
+Environment: Termux, VPS (Linux), Windows
+"""
+
+import os
+import re
+import sys
+import time
+import math
+import logging
+import asyncio
+import sqlite3
+import shutil
+from datetime import datetime, timedelta
+from collections import defaultdict
+from telebot import apihelper
+apihelper.ENABLE_MIDDLEWARE = True
+
+# Telebot kutubxonasi
+import telebot
+from telebot import types
+from telebot.util import quick_markup
+
+# Shazam va Media yuklovchi kutubxonalar
+import yt_dlp
+
+# ==========================================
+# CONSTANTS & CONFIGURATION
+# ==========================================
+BOT_TOKEN = "8719200267:AAE6han4Pf0fAEJuu51dglVFrpbnmo_tXK0"  # Bot tokenini shu yerga yozing
+ADMIN_ID = "7695063056"   # Admin Telegram ID sini shu yerga yozing
+CHANNELS = []  # Majburiy obuna kanallari (masalan, ['@shaxsi_blog'])
+
+DB_NAME = "universal_bot.db"
+LOG_DIR = "logs"
+DOWNLOAD_DIR = "downloads"
+
+# Limit sozlamalari (Oddiy foydalanuvchilar uchun)
+DAILY_VIDEO_LIMIT = 10
+DAILY_AUDIO_LIMIT = 5
+FLOOD_THRESHOLD = 2.0  # Ketma-ket so'rovlar orasidagi minimal vaqt (sekund)
+
+# Papkalarni yaratish
+os.makedirs(LOG_DIR, exist_ok=True)
+os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+
+# ==========================================
+# LOGGING SYSTEM CONFIGURATION
+# ==========================================
+formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+
+def setup_logger(name, log_file, level=logging.INFO):
+    """Alohida fayllar uchun loggerni sozlash funksiyasi"""
+    handler = logging.FileHandler(os.path.join(LOG_DIR, log_file), encoding='utf-8')
+    handler.setFormatter(formatter)
+    logger = logging.getLogger(name)
+    logger.setLevel(level)
+    logger.addHandler(handler)
+    return logger
+
+err_logger = setup_logger('errors_log', 'errors.log', logging.ERROR)
+user_logger = setup_logger('users_log', 'users.log', logging.INFO)
+dl_logger = setup_logger('downloads_log', 'downloads.log', logging.INFO)
+
+# Asosiy bot obyekti (Threaded=True vps va termux barqarorligi uchun)
+bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML", threaded=True)
+
+# Flood control xotirasi
+user_last_action = defaultdict(float)
+
+# ==========================================
+# DATABASE MANAGEMENT CLASS
+# ==========================================
+class Database:
+    def __init__(self, db_path):
+        self.db_path = db_path
+        self.init_db()
+
+    def get_conn(self):
+        """Ma'lumotlar bazasiga xavfsiz ulanish yaratish"""
+        conn = sqlite3.connect(self.db_path, timeout=20.0)
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    def init_db(self):
+        """Barcha kerakli jadvallarni yaratish va dastlabki sozlash"""
+        with self.get_conn() as conn:
+            cursor = conn.cursor()
+            
+            # Users jadvali
+            cursor.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                username TEXT,
+                first_name TEXT,
+                join_date TEXT,
+                is_banned INTEGER DEFAULT 0
+            )
+            """)
+            
+            # Premium foydalanuvchilar jadvali
+            cursor.execute("""
+            CREATE TABLE IF NOT EXISTS premium_users (
+                user_id INTEGER PRIMARY KEY,
+                premium_until TEXT,
+                FOREIGN KEY(user_id) REFERENCES users(user_id)
+            )
+            """)
+            
+            # Yuklanmalar tarixi va kunlik limitlar jadvali
+            cursor.execute("""
+            CREATE TABLE IF NOT EXISTS downloads (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                download_date TEXT,
+                media_type TEXT,
+                url TEXT
+            )
+            """)
+            
+            # Bot sozlamalari jadvali
+            cursor.execute("""
+            CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                value TEXT
+            )
+            """)
+            
+            # Tizim loglari jadvali (Baza ichida ham saqlash uchun)
+            cursor.execute("""
+            CREATE TABLE IF NOT EXISTS logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT,
+                level TEXT,
+                message TEXT
+            )
+            """)
+            
+            conn.commit()
+
+    def register_user(self, user_id, username, first_name):
+        """Foydalanuvchini bazaga qo'shish yoki yangilash"""
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with self.get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+            INSERT INTO users (user_id, username, first_name, join_date)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET
+                username = excluded.username,
+                first_name = excluded.first_name
+            """, (user_id, username, first_name, now))
+            conn.commit()
+
+    def is_banned(self, user_id):
+        """Foydalanuvchi bloklanganligini tekshirish"""
+        with self.get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT is_banned FROM users WHERE user_id = ?", (user_id,))
+            row = cursor.fetchone()
+            return row and row['is_banned'] == 1
+
+    def set_ban(self, user_id, status=1):
+        """Foydalanuvchini bloklash yoki blokdan chiqarish"""
+        with self.get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute("UPDATE users SET is_banned = ? WHERE user_id = ?", (status, user_id))
+            conn.commit()
+
+    def check_premium(self, user_id):
+        """Foydalanuvchining premium statusini va muddatini tekshirish"""
+        if user_id == ADMIN_ID:
+            return True, "Cheksiz (Admin)"
+        
+        with self.get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT premium_until FROM premium_users WHERE user_id = ?", (user_id,))
+            row = cursor.fetchone()
+            if row:
+                until_date = datetime.strptime(row['premium_until'], "%Y-%m-%d %H:%M:%S")
+                if until_date > datetime.now():
+                    return True, row['premium_until']
+                else:
+                    # Muddat tugagan bo'lsa o'chirish
+                    cursor.execute("DELETE FROM premium_users WHERE user_id = ?", (user_id,))
+                    conn.commit()
+            return False, None
+
+    def give_premium(self, user_id, days):
+        """Foydalanuvchiga kunlik hisobda premium muddatini berish"""
+        until_date = (datetime.now() + timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
+        with self.get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+            INSERT INTO premium_users (user_id, premium_until)
+            VALUES (?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET premium_until = excluded.premium_until
+            """, (user_id, until_date))
+            conn.commit()
+
+    def remove_premium(self, user_id):
+        """Premium statusini bekor qilish"""
+        with self.get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM premium_users WHERE user_id = ?", (user_id,))
+            conn.commit()
+
+    def log_download(self, user_id, media_type, url):
+        """Yuklab olish harakatini qayd etish"""
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with self.get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+            INSERT INTO downloads (user_id, download_date, media_type, url)
+            VALUES (?, ?, ?, ?)
+            """, (user_id, now, media_type, url))
+            conn.commit()
+
+    def get_daily_usage(self, user_id, media_type):
+        """Foydalanuvchining bugungi kunda yuklagan fayllari sonini aniqlash"""
+        today_start = datetime.now().strftime("%Y-%m-%d 00:00:00")
+        with self.get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+            SELECT COUNT(*) as cnt FROM downloads 
+            WHERE user_id = ? AND media_type = ? AND download_date >= ?
+            """, (user_id, media_type, today_start))
+            row = cursor.fetchone()
+            return row['cnt'] if row else 0
+
+    def get_stats(self):
+        """Admin panel uchun to'liq bot statistikasini yig'ish"""
+        today_start = datetime.now().strftime("%Y-%m-%d 00:00:00")
+        stats = {}
+        with self.get_conn() as conn:
+            cursor = conn.cursor()
+            
+            cursor.execute("SELECT COUNT(*) as total FROM users")
+            stats['total_users'] = cursor.fetchone()['total']
+            
+            cursor.execute("SELECT COUNT(*) as today FROM users WHERE join_date >= ?", (today_start,))
+            stats['today_users'] = cursor.fetchone()['today']
+            
+            cursor.execute("SELECT COUNT(*) as prem FROM premium_users")
+            stats['premium_users'] = cursor.fetchone()['prem']
+            
+            cursor.execute("SELECT COUNT(*) as dl FROM downloads")
+            stats['total_downloads'] = cursor.fetchone()['dl']
+            
+            cursor.execute("""
+                SELECT user_id, COUNT(*) as cnt FROM downloads 
+                GROUP BY user_id ORDER BY cnt DESC LIMIT 5
+            """)
+            stats['top_users'] = cursor.fetchall()
+            
+        return stats
+
+    def get_all_users(self):
+        """Hamma foydalanuvchilar ID ro'yxatini olish (Broadcast uchun)"""
+        with self.get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT user_id FROM users")
+            return [row['user_id'] for row in cursor.fetchall()]
+
+    def write_system_log(self, level, message):
+        """Baza ichki log tizimi"""
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with self.get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute("INSERT INTO logs (timestamp, level, message) VALUES (?, ?, ?)", (now, level, message))
+            conn.commit()
+
+db = Database(DB_NAME)
+
+# ==========================================
+# HELPER & UTILITY FUNCTIONS
+# ==========================================
+def check_channel_subscription(user_id):
+    """Majburiy obunani tekshirish funksiyasi"""
+    if not CHANNELS:
+        return True
+    if user_id == ADMIN_ID:
+        return True
+    
+    for channel in CHANNELS:
+        try:
+            member = bot.get_chat_member(channel, user_id)
+            if member.status in ['left', 'kicked']:
+                return False
+        except Exception as e:
+            err_logger.error(f"Kanal obunasini tekshirishda xatolik ({channel}): {e}")
+            # Agar bot kanalda admin bo'lmasa yoki kanal topilmasa xatolik chiqadi, o'tkazib yuboriladi
+            continue
+    return True
+
+def clean_old_downloads():
+    """Yuklab olingan va keshda qolgan fayllarni tozalash (Avtomatik boshqariladi)"""
+    try:
+        now = time.time()
+        for filename in os.listdir(DOWNLOAD_DIR):
+            filepath = os.path.join(DOWNLOAD_DIR, filename)
+            # 1 soatdan ko'p turgan fayllarni o'chirish
+            if os.path.getmtime(filepath) < now - 3600:
+                if os.path.isfile(filepath) or os.path.islink(filepath):
+                    os.unlink(filepath)
+                elif os.path.isdir(filepath):
+                    shutil.rmtree(filepath)
+    except Exception as e:
+        err_logger.error(f"Keshni tozalashda xatolik yuz berdi: {e}")
+
+def clean_old_downloads():
+    """Yuklab olingan va keshda qolgan fayllarni tozalash (Avtomatik boshqariladi)"""
+    try:
+        now = time.time()
+        for filename in os.listdir(DOWNLOAD_DIR):
+            filepath = os.path.join(DOWNLOAD_DIR, filename)
+            # 1 soatdan ko'p turgan fayllarni o'chirish
+            if os.path.getmtime(filepath) < now - 3600:
+                if os.path.isfile(filepath) or os.path.islink(filepath):
+                    os.unlink(filepath)
+                elif os.path.isdir(filepath):
+                    shutil.rmtree(filepath)
+    except Exception as e:
+        err_logger.error(f"Keshni tozalashda xatolik yuz berdi: {e}")
+
+def get_main_keyboard(user_id):
+    """Asosiy reply tugmalarni shakllantirish"""
+    is_prem, _ = db.check_premium(user_id)
+    kb = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
+    btn1 = types.KeyboardButton("👤 Profil va Limitlar")
+    btn2 = types.KeyboardButton("ℹ️ Bot Haqida")
+    kb.add(btn1, btn2)
+    if user_id == ADMIN_ID:
+        btn_admin = types.KeyboardButton("⚙️ Admin Panel")
+        kb.add(btn_admin)
+    return kb
+
+def get_subscription_keyboard():
+    """Majburiy obuna inline tugmalarini shakllantirish"""
+    kb = types.InlineKeyboardMarkup(row_width=1)
+    for idx, channel in enumerate(CHANNELS, start=1):
+        url = f"https://t.me/{channel.replace('@', '')}"
+        kb.add(types.InlineKeyboardButton(text=f"📣 {idx}-Kanalga a'zo bo'lish", url=url))
+    kb.add(types.InlineKeyboardButton(text=f"✅ Tekshirish", callback_data="check_subs"))
+    return kb
+
+# ==========================================
+# MIDDLEWARES & FILTER GUARDS
+# ==========================================
+@bot.middleware_handler(update_types=['message'])
+def anti_flood_and_ban_middleware(bot_instance, message):
+    """Spamga qarshi va ban holatini tekshiruvchi global himoya qatlam"""
+    if not message.from_user:
+        return
+
+    user_id = message.from_user.id
+    
+    # 1. Ban nazorati
+    if db.is_banned(user_id):
+        bot.send_message(user_id, "🚫 <b>Siz botdan foydalanishdan chetlashtirilgansiz!</b>")
+        return telebot.handler_backends.CancelUpdate()
+
+    # 2. Flood/Spam nazorati
+    current_time = time.time()
+    last_time = user_last_action[user_id]
+    if current_time - last_time < FLOOD_THRESHOLD:
+        bot.send_message(user_id, "⚠️ <b>Iltimos, ketma-ket tez so'rov yubormang. Biroz kuting!</b>")
+        user_last_action[user_id] = current_time
+        return telebot.handler_backends.CancelUpdate()
+    
+    user_last_action[user_id] = current_time
+    
+    # 3. Foydalanuvchini ro'yxatga olish / yangilash
+    db.register_user(user_id, message.from_user.username, message.from_user.first_name)
+    user_logger.info(f"User {user_id} -> {message.text or '[Media/Action]'}")
+
+# ==========================================
+# COMMAND & BASIC HANDLERS
+# ==========================================
+@bot.message_handler(commands=['start'])
+def start_command_handler(message):
+    user_id = message.from_user.id
+    first_name = message.from_user.first_name
+    
+    # Majburiy obuna tekshiruvi
+    if not check_channel_subscription(user_id):
+        bot.send_message(
+            user_id, 
+            "👋 <b>Assalomu alaykum!</b> Botdan to'liq foydalanish uchun hamkor kanallarimizga obuna bo'lishingiz shart.",
+            reply_markup=get_subscription_keyboard()
+        )
+        return
+
+    clean_old_downloads()
+    
+    welcome_text = (
+        f"👋 <b>Assalomu alaykum, {first_name}!</b>\n\n"
+        f"🚀 <b>Universal Media Downloader</b> botiga xush kelibsiz!\n\n"
+        f"✨ <b>Bot imkoniyatlari:</b>\n"
+        f"🔹 YouTube - Video va MP3 yuklash\n"
+        f"🔹 Instagram - Reels, Post va rasmlar\n"
+        f"🔹 TikTok - Watermarksiz sifatli videolar\n"
+        f"🎵 Shazam - Ovozi yoki audio orqali qo'shiq topish\n\n"
+        f"📥 <i>Siz shunchaki media havolasini yuboring yoki audio yozib qoldiring!</i>"
+    )
+    
+    bot.send_message(user_id, welcome_text, reply_markup=get_main_keyboard(user_id))
+
+@bot.message_handler(func=lambda msg: msg.text in ["👤 Profil va Limitlar", "ℹ️ Bot Haqida"])
+def menu_buttons_handler(message):
+    user_id = message.from_user.id
+    if not check_channel_subscription(user_id):
+        bot.send_message(user_id, "⚠️ Botdan foydalanish uchun oldin kanallarga a'zo bo'ling.", reply_markup=get_subscription_keyboard())
+        return
+
+    if message.text == "👤 Profil va Limitlar":
+        is_prem, until = db.check_premium(user_id)
+        v_used = db.get_daily_usage(user_id, 'video')
+        a_used = db.get_daily_usage(user_id, 'audio')
+        
+        status_str = f"👑 Premium ({until})" if is_prem else "📝 Oddiy foydalanuvchi"
+        v_limit_str = "Cheksiz" if is_prem else f"{DAILY_VIDEO_LIMIT - v_used} / {DAILY_VIDEO_LIMIT}"
+        a_limit_str = "Cheksiz" if is_prem else f"{DAILY_AUDIO_LIMIT - a_used} / {DAILY_AUDIO_LIMIT}"
+        
+        profile_text = (
+            f"👤 <b>Sizning Profilingiz:</b>\n\n"
+            f"🆔 <b>ID:</b> <code>{user_id}</code>\n"
+            f"🌟 <b>Status:</b> {status_str}\n\n"
+            f"📊 <b>Bugungi qolgan limitlaringiz:</b>\n"
+            f"🎬 <b>Video yuklash:</b> {v_limit_str}\n"
+            f"🎵 <b>Audio/Shazam:</b> {a_limit_str}\n"
+        )
+        bot.send_message(user_id, profile_text)
+        
+    elif message.text == "ℹ️ Bot Haqida":
+        about_text = (
+            f"🤖 <b>Universal Media Downloader Bot</b>\n\n"
+            f"Ushbu bot eng mashhur ijtimoiy tarmoqlardan yuqori tezlikda multimedia kontentlarini yuklab berish va "
+            f"Shazam texnologiyasi orqali musiqalarni tezkor qidirib topish uchun yaratilgan.\n\n"
+            f"⚠️ Bot yuklanayotgan fayllarning mualliflik huquqiga javobgar emas. Tizim avtomatlashtirilgan."
+        )
+        bot.send_message(user_id, about_text)
+
+@bot.callback_query_handler(func=lambda call: call.data == "check_subs")
+def callback_subscription_check(call):
+    user_id = call.from_user.id
+    if check_channel_subscription(user_id):
+        bot.answer_callback_query(call.id, "✅ Rahmat! Obuna tasdiqlandi.", show_alert=True)
+        bot.delete_message(chat_id=user_id, message_id=call.message.message_id)
+        bot.send_message(user_id, "🚀 Bot ishga tushdi! Havola yuborishingiz mumkin.", reply_markup=get_main_keyboard(user_id))
+    else:
+        bot.answer_callback_query(call.id, "❌ Siz hali barcha kanallarga obuna bo'lmagansiz!", show_alert=True)
+
+# ==========================================
+# SHAZAM AUDIO IDENTIFICATION ENGINE
+# ==========================================
+async def process_shazam_search(file_path):
+    """Shazam API orqali audio faylni aniqlash"""
+    shazam = Shazam()
+    try:
+        out = await shazam.recognize(file_path)
+        if out and 'track' in out:
+            track = out['track']
+            title = track.get('title', 'Noma\'lum')
+            artist = track.get('subtitle', 'Noma\'lum')
+            # Muqova rasmi
+            images = track.get('images', {})
+            cover_url = images.get('coverarthq', images.get('coverart', None))
+            return {"status": True, "title": title, "artist": artist, "cover": cover_url}
+        return {"status": False, "message": "Musiqa topilmadi 😔"}
+    except Exception as e:
+        err_logger.error(f"Shazam tanib olish xatosi: {e}")
+        return {"status": False, "message": f"Xato yuz berdi: {str(e)}"}
+
+@bot.message_handler(content_types=['voice', 'audio'])
+def voice_audio_shazam_handler(message):
+    user_id = message.from_user.id
+    if not check_channel_subscription(user_id):
+        bot.send_message(user_id, "⚠️ Avval kanallarga a'zo bo'ling.", reply_markup=get_subscription_keyboard())
+        return
+
+    # Limitlarni tekshirish
+    is_prem, _ = db.check_premium(user_id)
+    if not is_prem:
+        used = db.get_daily_usage(user_id, 'audio')
+        if used >= DAILY_AUDIO_LIMIT:
+            bot.send_message(user_id, f"❌ <b>Kunlik qidiruv va audio limitingiz ({DAILY_AUDIO_LIMIT} ta) tugadi!</b>\nPremium sotib olish uchun adminga murojaat qiling.")
+            return
+
+    status_msg = bot.send_message(user_id, "🔍 <b>Musiqa tahlil qilinmoqda... Iltimos kuting.</b>")
+    
+    try:
+        file_id = message.voice.file_id if message.content_type == 'voice' else message.audio.file_id
+        file_info = bot.get_file(file_id)
+        
+        # Faylni yuklab olish
+        ext = file_info.file_path.split('.')[-1]
+        local_filename = f"shazam_{user_id}_{int(time.time())}.{ext}"
+        local_path = os.path.join(DOWNLOAD_DIR, local_filename)
+        
+        downloaded_file = bot.download_file(file_info.file_path)
+        with open(local_path, 'wb') as new_file:
+            new_file.write(downloaded_file)
+            
+        # Asinxron shazam funksiyasini chaqirish
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        result = loop.run_until_complete(process_shazam_search(local_path))
+        loop.close()
+        
+        if result['status']:
+            caption = f"🎵 <b>Musiqa topildi!</b>\n\n📌 <b>Nomi:</b> {result['title']}\n🎤 <b>Ijrochi:</b> {result['artist']}"
+            db.log_download(user_id, 'audio', f"Shazam: {result['artist']} - {result['title']}")
+            dl_logger.info(f"User {user_id} identified music via Shazam: {result['artist']} - {result['title']}")
+            
+            if result['cover']:
+                bot.send_photo(user_id, result['cover'], caption=caption)
+            else:
+                bot.send_message(user_id, caption)
+        else:
+            bot.send_message(user_id, result['message'])
+            
+        # Ishlatilgan faylni tozalash
+        if os.path.exists(local_path):
+            os.remove(local_path)
+            
+    except Exception as e:
+        err_logger.error(f"Shazam handler xatosi: {e}")
+        bot.send_message(user_id, "❌ Audio faylni tahlil qilishda xatolik yuz berdi.")
+    finally:
+        bot.delete_message(chat_id=user_id, message_id=status_msg.message_id)
+        clean_old_downloads()
+
+# ==========================================
+# YT-DLP MEDIA DOWNLOAD CORE ENGINE
+# ==========================================
+def download_media_ytdlp(url, mode='video'):
+    """yt-dlp orqali universal yuklash yadrosi"""
+    timestamp = int(time.time())
+    
+    # Har qanday tarmoq uchun eng universal yuklash sozlamalari
+    ydl_opts = {
+        'outtmpl': os.path.join(DOWNLOAD_DIR, f'media_dl_{timestamp}_%(id)s.%(ext)s'),
+        'quiet': True,
+        'no_warnings': True,
+        'ignoreerrors': False,
+    }
+    
+    if mode == 'audio':
+        ydl_opts.update({
+            'format': 'bestaudio/best',
+            'postprocessors': [{
+                'key': 'FFmpegExtractAudio',
+                'preferredcodec': 'mp3',
+                'preferredquality': '192',
+            }],
+        })
+    else:
+        # Eng muvofiq video formatni aniqlash (Telegram mos kelishi va 50MB dan oshmasligi uchun)
+        ydl_opts.update({
+            'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
+        })
+
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            if 'entries' in info:
+                # Agar playlist bo'lsa, birinchi elementni olamiz
+                info = info['entries'][0]
+                
+            filename = ydl.prepare_filename(info)
+            if mode == 'audio':
+                # MP3 o'zgarishini inobatga olish
+                filename = os.path.splitext(filename)[0] + ".mp3"
+                
+            return {"status": True, "filepath": filename, "title": info.get('title', 'Media')}
+    except Exception as e:
+        err_logger.error(f"yt-dlp xatoligi URL: {url} | Xato: {e}")
+        return {"status": False, "message": str(e)}
+
+@bot.message_handler(func=lambda msg: msg.text and (msg.text.startswith("http://") or msg.text.startswith("https://")))
+def incoming_links_handler(message):
+    user_id = message.from_user.id
+    url = message.text.strip()
+    
+    if not check_channel_subscription(user_id):
+        bot.send_message(user_id, "⚠️ Avval kanallarga a'zo bo'ling.", reply_markup=get_subscription_keyboard())
+        return
+
+    # Tizim yuklovchi format turini aniqlash
+    mode = 'video'
+    db_type = 'video'
+    
+    # YouTube audio so'rovi uchun qo'shimcha inline panel yaratish
+    if "youtube.com" in url or "youtu.be" in url:
+        kb = types.InlineKeyboardMarkup(row_width=2)
+        kb.add(
+            types.InlineKeyboardButton("🎬 Video (MP4)", callback_data=f"ytdl_v||{url}"),
+            types.InlineKeyboardButton("🎵 Audio (MP3)", callback_data=f"ytdl_a||{url}")
+        )
+        bot.send_message(user_id, "🎥 YouTube havolasi aniqlandi. Formatingizni tanlang:", reply_markup=kb)
+        return
+
+    # Instagram yoki TikTok yuklash jarayoni to'g'ridan-to'g'ri video formatda ketadi
+    is_prem, _ = db.check_premium(user_id)
+    if not is_prem:
+        used = db.get_daily_usage(user_id, db_type)
+        limit_max = DAILY_VIDEO_LIMIT if db_type == 'video' else DAILY_AUDIO_LIMIT
+        if used >= limit_max:
+            bot.send_message(user_id, f"❌ <b>Kunlik yuklash limitingiz ({limit_max} ta) tugadi!</b>\nPremium sotib olish uchun adminga murojaat qiling.")
+            return
+
+    status_msg = bot.send_message(user_id, "⏳ <b>Havola tahlil qilinmoqda va yuklanmoqda...</b>")
+    
+    # Yuklash oqimi
+    res = download_media_ytdlp(url, mode=mode)
+    
+    if res['status']:
+        filepath = res['filepath']
+        title = res['title']
+        
+        try:
+            bot.set_my_commands
+            if os.path.exists(filepath):
+                # Telegram orqali yuborish hajmini tekshirish (Max 50MB)
+                file_size = os.path.getsize(filepath) / (1024 * 1024)
+                if file_size > 50.0:
+                    bot.send_message(user_id, f"⚠️ <b>Fayl hajmi juda katta ({file_size:.1f} MB)!</b>\nTelegram botlari orqali faqat 50MB gacha bo'lgan fayllarni yuborish mumkin.")
+                else:
+                    bot.send_chat_action(user_id, 'upload_video')
+                    with open(filepath, 'rb') as video_file:
+                        bot.send_video(user_id, video_file, caption=f"🎬 <b>{title}</b>\n\n📥 @{bot.get_me().username} orqali yuklandi")
+                    
+                    db.log_download(user_id, db_type, url)
+                    dl_logger.info(f"User {user_id} successfully downloaded video: {url}")
+            else:
+                bot.send_message(user_id, "❌ Fayl yuklashda xatolik: fayl topilmadi.")
+        except Exception as send_err:
+            err_logger.error(f"Fayl yuborishda xatolik: {send_err}")
+            bot.send_message(user_id, "❌ Yuklangan faylni yuborishda muammo yuz berdi.")
+        finally:
+            if os.path.exists(filepath):
+                os.remove(filepath)
+    else:
+        bot.send_message(user_id, "❌ <b>Media yuklab olishda muammo yuz berdi.</b>\nHavola noto'g'ri yoki sayt himoyasi mavjud.")
+        
+    bot.delete_message(chat_id=user_id, message_id=status_msg.message_id)
+    clean_old_downloads()
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("ytdl_"))
+def youtube_callback_handler(call):
+    user_id = call.from_user.id
+    data_parts = call.data.split("||")
+    action = data_parts[0]
+    url = data_parts[1]
+    
+    mode = 'video' if action == 'ytdl_v' else 'audio'
+    db_type = 'video' if mode == 'video' else 'audio'
+    
+    is_prem, _ = db.check_premium(user_id)
+    if not is_prem:
+        used = db.get_daily_usage(user_id, db_type)
+        limit_max = DAILY_VIDEO_LIMIT if db_type == 'video' else DAILY_AUDIO_LIMIT
+        if used >= limit_max:
+            bot.answer_callback_query(call.id, "Kunlik limit tugagan!", show_alert=True)
+            return
+
+    bot.delete_message(chat_id=user_id, message_id=call.message.message_id)
+    status_msg = bot.send_message(user_id, f"📥 <b>YouTube yuklanmoqda ({mode.upper()})... Iltimos kuting.</b>")
+    
+    res = download_media_ytdlp(url, mode=mode)
+    if res['status']:
+        filepath = res['filepath']
+        title = res['title']
+        
+        try:
+            if os.path.exists(filepath):
+                file_size = os.path.getsize(filepath) / (1024 * 1024)
+                if file_size > 50.0:
+                    bot.send_message(user_id, f"⚠️ <b>Fayl hajmi juda katta ({file_size:.1f} MB)!</b> Telegram cheklovi tufayli yuborilmadi.")
+                else:
+                    if mode == 'video':
+                        bot.send_chat_action(user_id, 'upload_video')
+                        with open(filepath, 'rb') as vf:
+                            bot.send_video(user_id, vf, caption=f"🎬 <b>{title}</b>\n\n📥 @{bot.get_me().username}")
+                    else:
+                        bot.send_chat_action(user_id, 'upload_audio')
+                        with open(filepath, 'rb') as af:
+                            bot.send_audio(user_id, af, caption=f"🎵 <b>{title}</b>\n\n📥 @{bot.get_me().username}")
+                    
+                    db.log_download(user_id, db_type, url)
+                    dl_logger.info(f"User {user_id} downloaded YT {mode}: {url}")
+            else:
+                bot.send_message(user_id, "❌ Fayl tizimda topilmadi.")
+        except Exception as e:
+            err_logger.error(f"YT yuborishda xato: {e}")
+            bot.send_message(user_id, "❌ Faylni yuborish jarayonida uzilish ro'y berdi.")
+        finally:
+            if os.path.exists(filepath):
+                os.remove(filepath)
+    else:
+        bot.send_message(user_id, "❌ Yuklash bajarilmadi. Havolani qayta tekshiring.")
+        
+    bot.delete_message(chat_id=user_id, message_id=status_msg.message_id)
+    clean_old_downloads()
+
+# ==========================================
+# ADVANCED ADMIN PANEL CONTROL
+# ==========================================
+@bot.message_handler(func=lambda msg: msg.text == "⚙️ Admin Panel" and msg.from_user.id == ADMIN_ID)
+@bot.message_handler(commands=['admin'])
+def admin_panel_root(message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    
+    admin_menu = (
+        "🛠 <b>Professional Admin Panelga Xush Kelibsiz!</b>\n\n"
+        "👑 <b>Buyruqlar ro'yxati:</b>\n"
+        "📊 /stats - Bot statistikasi\n"
+        "👥 /users - Barcha foydalanuvchilar soni\n"
+        "🚀 /broadcast - Barcha foydalanuvchilarga xabar yuborish\n"
+        "➕ /premium [ID] [KUN] - Premium berish\n"
+        "➖ /unpremium [ID] - Premium bekor qilish\n"
+        "🚫 /ban [ID] - Bloklash\n"
+        "🟢 /unban [ID] - Blokdan chiqarish"
+    )
+    bot.send_message(ADMIN_ID, admin_menu)
+
+@bot.message_handler(commands=['stats'])
+def admin_stats_handler(message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    
+    st = db.get_stats()
+    
+    top_users_str = ""
+    for idx, row in enumerate(st['top_users'], start=1):
+        top_users_str += f"  {idx}. ID: <code>{row['user_id']}</code> - {row['cnt']} ta yuklanma\n"
+        
+    stats_text = (
+        f"📊 <b>Botning Real-Vaqt Statistikasi:</b>\n\n"
+        f"👥 <b>Jami a'zolar:</b> {st['total_users']} ta\n"
+        f"📈 <b>Bugun qo'shilganlar:</b> {st['today_users']} ta\n"
+        f"👑 <b>Premium a'zolar:</b> {st['premium_users']} ta\n"
+        f"📥 <b>Jami yuklangan media:</b> {st['total_downloads']} ta\n\n"
+        f"🏆 <b>Eng faol foydalanuvchilar:</b>\n{top_users_str if top_users_str else ' Hozircha mavjud emas.'}"
+    )
+    bot.send_message(ADMIN_ID, stats_text)
+
+@bot.message_handler(commands=['users'])
+def admin_users_count(message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    st = db.get_stats()
+    bot.send_message(ADMIN_ID, f"👥 Bot foydalanuvchilari jami soni: <b>{st['total_users']}</b> ta.")
+
+@bot.message_handler(commands=['premium'])
+def admin_give_premium_handler(message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    
+    try:
+        parts = message.text.split()
+        if len(parts) < 3:
+            bot.send_message(ADMIN_ID, "⚠️ Format: `/premium [Foydalanuvchi_ID] [Kun_Soni]`")
+            return
+            
+        target_id = int(parts[1])
+        days = int(parts[2])
+        
+        db.give_premium(target_id, days)
+        bot.send_message(ADMIN_ID, f"✅ ID: <code>{target_id}</code> bo'lgan foydalanuvchiga {days} kunga premium berildi!")
+        
+        # Foydalanuvchini ogohlantirish
+        try:
+            bot.send_message(target_id, f"🎉 <b>Tabriklaymiz! Admin sizga {days} kunga Premium statusini berdi.</b>\nEndi sizda barcha limitlar cheksiz!")
+        except Exception:
+            pass
+    except Exception as e:
+        bot.send_message(ADMIN_ID, f"❌ Xatolik yuz berdi: {e}")
+
+@bot.message_handler(commands=['unpremium'])
+def admin_remove_premium_handler(message):
+    if message.from_user.id != ADMIN_ID:
+        return
+        
+    try:
+        parts = message.text.split()
+        if len(parts) < 2:
+            bot.send_message(ADMIN_ID, "⚠️ Format: `/unpremium [Foydalanuvchi_ID]`")
+            return
+            
+        target_id = int(parts[1])
+        db.remove_premium(target_id)
+        bot.send_message(ADMIN_ID, f"✅ ID: <code>{target_id}</code> bo'lgan foydalanuvchidan premium olib tashlandi.")
+    except Exception as e:
+        bot.send_message(ADMIN_ID, f"❌ Xatolik yuz berdi: {e}")
+
+@bot.message_handler(commands=['ban'])
+def admin_ban_handler(message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    try:
+        parts = message.text.split()
+        if len(parts) < 2:
+            bot.send_message(ADMIN_ID, "⚠️ Format: `/ban [Foydalanuvchi_ID]`")
+            return
+        target_id = int(parts[1])
+        db.set_ban(target_id, 1)
+        bot.send_message(ADMIN_ID, f"🚫 ID: <code>{target_id}</code> bloklandi.")
+    except Exception as e:
+        bot.send_message(ADMIN_ID, f"❌ Xatolik: {e}")
+
+@bot.message_handler(commands=['unban'])
+def admin_unban_handler(message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    try:
+        parts = message.text.split()
+        if len(parts) < 2:
+            bot.send_message(ADMIN_ID, "⚠️ Format: `/unban [Foydalanuvchi_ID]`")
+            return
+        target_id = int(parts[1])
+        db.set_ban(target_id, 0)
+        bot.send_message(ADMIN_ID, f"🟢 ID: <code>{target_id}</code> blokdan chiqarildi.")
+    except Exception as e:
+        bot.send_message(ADMIN_ID, f"❌ Xatolik: {e}")
+
+# ==========================================
+# SMART BROADCAST SYSTEM (XABAR YUBORISH)
+# ==========================================
+@bot.message_handler(commands=['broadcast'])
+def admin_broadcast_trigger(message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    sent = bot.send_message(ADMIN_ID, "📝 <b>Barcha foydalanuvchilarga yuboriladigan xabarni kiriting (Matn, rasm yoki video):</b>")
+    bot.register_next_step_handler(sent, process_admin_broadcast)
+
+def process_admin_broadcast(message):
+    if message.from_user.id != ADMIN_ID:
+        return
+        
+    all_users = db.get_all_users()
+    bot.send_message(ADMIN_ID, f"🚀 <b>Xabar yuborish boshlandi... Jami manzillar: {len(all_users)}</b>")
+    
+    success = 0
+    failed = 0
+    
+    for u_id in all_users:
+        try:
+            if message.content_type == 'text':
+                bot.send_message(u_id, message.text, parse_mode="HTML")
+            elif message.content_type == 'photo':
+                bot.send_photo(u_id, message.photo[-1].file_id, caption=message.caption, parse_mode="HTML")
+            elif message.content_type == 'video':
+                bot.send_video(u_id, message.video.file_id, caption=message.caption, parse_mode="HTML")
+            success += 1
+            # Telegram Flood limitlariga tushmaslik uchun kichik kechikish
+            time.sleep(0.05)
+        except Exception:
+            failed += 1
+            continue
+            
+    bot.send_message(ADMIN_ID, f"📢 <b>Xabar yuborish yakunlandi!</b>\n\n✅ Muvaffaqiyatli: {success}\n❌ Muammoli: {failed}")
+
+# ==========================================
+# APPLICATION BOOTSTRAPPER (INFINITY POLLING)
+# ==========================================
+if __name__ == "__main__":
+    db.write_system_log("INFO", "Bot muvaffaqiyatli ishga tushirildi.")
+    print(">>> Universal Telegram Media Bot muvaffaqiyatli ishlamoqda...")
+    
+    # Botni cheksiz tsiklda qayta-qayta ishga tushirish (Termux/VPS xavfsizligi)
+    while True:
+        try:
+            bot.infinity_polling(timeout=60, long_polling_timeout=30)
+        except Exception as global_err:
+            err_logger.error(f"Infinity polling global xatosi: {global_err}")
+            db.write_system_log("CRITICAL", f"Polling uzilishi: {str(global_err)}")
+            time.sleep(5)  # Qayta ulanishdan oldin kutish
